@@ -1,0 +1,146 @@
+PivotStatusReports Query
+------------------------
+let
+    // Import configuration settings from the Excel workbook.
+    // Each of these values is stored in a named cell on the "Config" worksheet.
+    // Note:  The "FilterEnd" cell is on a hidden row directly under the "End Date".
+    #"Import Database Path" = Excel.CurrentWorkbook(){[Name="DatabasePath"]}[Content][Column1]{0},
+    #"Import Passed Text" = Excel.CurrentWorkbook(){[Name="PassedText"]}[Content][Column1]{0},
+    #"Import Filter Start" = Excel.CurrentWorkbook(){[Name="FilterStart"]}[Content][Column1]{0},
+    #"Import Filter End" = Excel.CurrentWorkbook(){[Name="FilterEnd"]}[Content][Column1]{0},
+
+    // Open the Access database on the Z:\ drive and load the appropriate table.
+    #"Load Database" = Access.Database(File.Contents(#"Import Database Path"), [CreateNavigationProperties=true]),
+    #"Apply Schema" = #"Load Database"{[Schema="",Item="tbStatusReports"]}[Data],
+
+    // Filter the data to just the selected date range.
+    #"Filter Rows" = Table.SelectRows(#"Apply Schema", each [reportTime] >= #"Import Filter Start" and [reportTime] < #"Import Filter End"),
+
+    // Expand the status codes and replace passing values with the value from "PassedText".
+    #"Expand tbStatusCodes" = Table.ExpandRecordColumn(#"Filter Rows", "tbStatusCodes", {"tbStatusDeviceName"}, {"tbStatusDeviceName"}),
+    #"Replace CCTV Passed" = Table.ReplaceValue(#"Expand tbStatusCodes","CCTV PASSED",#"Import Passed Text",Replacer.ReplaceText,{"tbStatusDeviceName"}),
+    #"Replace DMS Passed" = Table.ReplaceValue(#"Replace CCTV Passed","DMS PASSED",#"Import Passed Text",Replacer.ReplaceText,{"tbStatusDeviceName"}),
+    #"Replace CMS Passed" = Table.ReplaceValue(#"Replace DMS Passed","CMS PASSED",#"Import Passed Text",Replacer.ReplaceText,{"tbStatusDeviceName"}),
+    #"Replace Sensor Passed" = Table.ReplaceValue(#"Replace CMS Passed","SENSOR PASSED",#"Import Passed Text",Replacer.ReplaceText,{"tbStatusDeviceName"}),
+
+    // Add a column with just the date portion of each row's DataTime timestamp.
+    // We don't actually need the time of day and it's simpler to work with just the date.
+    #"Add Date Column" = Table.AddColumn(#"Replace Sensor Passed", "reportDate", each Date.From([reportTime])),
+    #"Change to Date" = Table.TransformColumnTypes(#"Add Date Column",{{"reportDate", type date}}),
+
+    // Sort the rows in decending order by report time (so the most recent status report is on top) and remove any duplicate devices.
+    // This keeps only the most recent status report and ensures there is no more than one report for each device on each day.
+    // Note:  Using "Table.Buffer()" here forces these steps to happen in the correct order no matter what.
+    //        Sometimes Access will decide to rearrange steps to be "more efficient", but that can accidentally break this part of the process.
+    //        Using "Table.Buffer()" fixes that issue in this particular case.
+    #"Sort and Buffer Rows" = Table.Buffer(Table.Sort(#"Change to Date",{{"reportTime", Order.Descending}})),
+    #"Remove Duplicates" = Table.Distinct(#"Sort and Buffer Rows", {"reportDevice", "reportDate"}),
+
+    // Prepare for, and then pivot, the data table to create a column for each unique date.
+    // First, remove any columns except the 3 below:  "reportDevice", "tbStatusDeviceName", and "reportDate".
+    #"Remove Extra Columns" = Table.SelectColumns(#"Remove Duplicates",{"reportDevice", "tbStatusDeviceName", "reportDate"}),
+    // Next, resort the rows in ascending order by report date (from oldest to newest).
+    // This will be the order of the columns we create in the next step.
+    #"Resort Rows" = Table.Sort(#"Remove Extra Columns",{{"reportDate", Order.Ascending}}),
+    // Pivot the entire table so the report dates become the new column headings.
+    #"Pivot Table" = Table.Pivot(Table.TransformColumnTypes(#"Resort Rows", {{"reportDate", type text}}, "en-US"), List.Distinct(Table.TransformColumnTypes(#"Resort Rows", {{"reportDate", type text}}, "en-US")[reportDate]), "reportDate", "tbStatusDeviceName"),
+    // Finally, replace any empty cells with a dash (this simplifies the next few steps below).
+    #"Replace Null Reports" = Table.ReplaceValue(#"Pivot Table",null,"-",Replacer.ReplaceValue,Table.ColumnNames(#"Pivot Table")),
+
+    // Add several columns so we can more easily calculate the metrics for this data.
+    // Count how many dates are in the table (check the column headings for a "/" character).
+    #"Add maxDaysTested" = Table.AddColumn(#"Replace Null Reports", "maxDaysTested", each List.Accumulate(Record.FieldNames(_), 0, (state, current)=> if Text.Contains(Text.From(current), "/") then state + 1 else state)),
+    // Count how many days each device was not tested (note:  "NOT DEPLOYED" counts as not tested for these metrics, even though it WAS technically tested).
+    #"Add daysNotTested" = Table.AddColumn(#"Add maxDaysTested", "daysNotTested", each List.Accumulate(Record.FieldValues(_), 0, (state, current)=> if current="-" or current="NOT DEPLOYED" then state + 1 else state)),
+    // Count how many days each device passed (look for the same value from "PassedText" we used above).
+    // Note:  The status "LOW DISPLAY ISSUE" also counts as "passing" for this metric since it's a fairly minor error.
+    #"Add Tests Passed" = Table.AddColumn(#"Add daysNotTested", "Tests Passed", each List.Accumulate(Record.FieldValues(_), 0, (state, current)=> if current=#"Import Passed Text" or current="LOW DISPLAY ISSUE" then state + 1 else state)),
+    // Count how many days each device failed (if it WAS tested but didn't pass, it failed).
+    #"Add Tests Failed" = Table.AddColumn(#"Add Tests Passed", "Tests Failed", each [maxDaysTested]-([daysNotTested]+[Tests Passed])),
+
+    // Add the columns for the actual metrics we are trying to calculate.
+    // Use the metrics above to calculate up-time, down-time, and "x of y" days the device was down.
+    #"Add Up Time" = Table.AddColumn(#"Add Tests Failed", "Up Time", each if [maxDaysTested]=[daysNotTested] then 0 else [Tests Passed]/([maxDaysTested]-[daysNotTested])),
+    #"Add Down Time" = Table.AddColumn(#"Add Up Time", "Down Time", each if [maxDaysTested]=[daysNotTested] then 0 else 1-[Up Time]),
+    #"Add Days Down" = Table.AddColumn(#"Add Down Time", "Days Down", each Text.Combine({Text.From([Tests Failed]), " of ", Text.From([maxDaysTested]-[daysNotTested]), " tests"})),
+
+    // Remove the columns we only needed to compute these metrics.
+    // Keep the "Tests Passed" and "Tests Failed" columns since those are actually metrics in themselves.
+    #"Remove Calculation Columns" = Table.RemoveColumns(#"Add Days Down",{"maxDaysTested", "daysNotTested"})
+in
+    // Output the resulting table.
+    #"Remove Calculation Columns"
+
+
+MergeWithDevices Query
+----------------------
+let
+    // Import configuration settings from the Excel workbook.
+    // Each of these values is stored in a named cell on the "Config" worksheet.
+    #"Import Database Path" = Excel.CurrentWorkbook(){[Name="DatabasePath"]}[Content][Column1]{0},
+    #"Import ICMZone" = Excel.CurrentWorkbook(){[Name="ICMZone"]}[Content][Column1]{0},
+    #"Import AddZone" = Excel.CurrentWorkbook(){[Name="AddZone"]}[Content][Column1]{0},
+
+    // Open the Access database on the Z:\ drive and load the appropriate table.
+    #"Load Database" = Access.Database(File.Contents(#"Import Database Path"), [CreateNavigationProperties=true]),
+    #"Apply Schema" = #"Load Database"{[Schema="",Item="tbDevices"]}[Data],
+
+    // Expand the sub-tables for the device types ("tbDevTypes") and the ICM zones ("tbICM").
+    #"Expand tbDevTypes" = Table.ExpandRecordColumn(#"Apply Schema", "tbDevTypes", {"devTypeName"}, {"devTypeName"}),
+    #"Expand tbICM" = Table.ExpandRecordColumn(#"Expand tbDevTypes", "tbICM", {"ICMName"}, {"ICMName"}),
+
+    // Filter the data to just the selected ICM zone.
+    #"Filter ICMName" = Table.SelectRows(#"Expand tbICM", each ([ICMName] = #"Import ICMZone" or [ICMName] = #"Import AddZone")),
+    // Also remove any devices which are not part of *any* ICM zone.
+    #"Filter Null ICMs" = Table.SelectRows(#"Filter ICMName", each ([ICMName] <> null)),
+    // Finally, remove any devices which do not have a device type set.
+    #"Filter devTypeName" = Table.SelectRows(#"Filter Null ICMs", each ([devTypeName] <> null)),
+
+    // Remove any columns except the 4 below:  "dbDeviceID", "ncDeviceName", "devTypeName", and "ICMName".
+    #"Remove Extra Columns" = Table.SelectColumns(#"Filter devTypeName",{"dbDeviceID", "ncDeviceName", "devTypeName", "ICMName"}),
+    // Then move the "ncDeviceName" column to the end of the table.
+    #"Reorder Columns" = Table.ReorderColumns(#"Remove Extra Columns",{"dbDeviceID", "devTypeName", "ICMName", "ncDeviceName"}),
+
+    // Merge the status reports from the "PivotStatusReports" query.
+    // Match the records based on the "dbDeviceID" field (primary key) and "reportDevice" field (foreign key).
+    // Note:  The "PivotStatusReports" query was already filtered for the selected date range.
+    #"Merge Status Reports" = Table.NestedJoin(#"Reorder Columns", {"dbDeviceID"}, PivotStatusReports, {"reportDevice"}, "PivotStatusReports", JoinKind.LeftOuter),
+    // Expand the merged status reports (they are imported as a sub-table for some reason).
+    // Note:  Using "Table.ColumnNames(PivotStatusReports)" expands ALL of the columns in the sub-table.
+    //        This allows the sub-query to contain any number of columns without us having to worry about how many there are or doing anything else fancy.
+    #"Expand PivotStatusReports" = Table.ExpandTableColumn(#"Merge Status Reports", "PivotStatusReports", Table.ColumnNames(PivotStatusReports)),
+
+    // Remove both of the columns we used to merge the 2 queries.
+    #"Remove Linking Columns" = Table.RemoveColumns(#"Expand PivotStatusReports",{"dbDeviceID", "reportDevice"}),
+
+    // Perform some final clean up before presenting the data.
+    // Sort the rows in ascending order first by device type, then by ICM zone (so the multi-zone devices stay grouped together), then by the device name.
+    #"Sort Rows" = Table.Sort(#"Remove Linking Columns",{{"devTypeName", Order.Ascending}, {"ICMName", Order.Ascending}, {"ncDeviceName", Order.Ascending}}),
+    // Give 3 of the columns "friendly" names for the reader.
+    #"Rename Columns" = Table.RenameColumns(#"Sort Rows",{{"devTypeName", "Device Type"}, {"ICMName", "ICM Zone"}, {"ncDeviceName", "Device"}}),
+    // Replace any null calculated values with 0 (ideally, this shouldn't be necessary, but just in case).
+    #"Replace Null Calculations" = Table.ReplaceValue(#"Rename Columns",null,0,Replacer.ReplaceValue,{"Tests Passed", "Tests Failed", "Up Time", "Down Time"}),
+    // Replace any null days down strings with "0 of 0 tests" (ideally, this shouldn't be necessary, but just in case).
+    #"Replace Null Days Down" = Table.ReplaceValue(#"Replace Null Calculations",null,"0 of 0 tests",Replacer.ReplaceValue,{"Days Down"}),
+    // Replace any other null values anywhere else in the table with a dash (ideally, this shouldn't be necessary, but just in case).
+    #"Replace Null Results" = Table.ReplaceValue(#"Replace Null Days Down",null,"-",Replacer.ReplaceValue,Table.ColumnNames(#"Replace Null Days Down")),
+    // Make sure the "Up Time" and "Down Time" columns are displayed as percentages.
+    #"Change To Percentage" = Table.TransformColumnTypes(#"Replace Null Results",{{"Up Time", Percentage.Type},{"Down Time", Percentage.Type}})
+in
+    // Output the resulting table.
+    #"Change To Percentage"
+
+
+ICMList Query
+-------------
+let
+    // Import the database path from the Excel workbook.
+    // This is stored in a named cell on the "Config" worksheet.
+    #"Import Database Path" = Excel.CurrentWorkbook(){[Name="DatabasePath"]}[Content][Column1]{0},
+
+    // Open the Access database on the Z:\ drive and load the appropriate table.
+    #"Load Database" = Access.Database(File.Contents(#"Import Database Path"), [CreateNavigationProperties=true]),
+    #"Apply Schema" = #"Load Database"{[Schema="",Item="tbICM"]}[Data]
+in
+    // Output the resulting table.
+    #"Apply Schema"
